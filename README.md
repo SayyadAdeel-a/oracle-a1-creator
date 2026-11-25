@@ -113,6 +113,10 @@ while that OCI resource is present.
 - Capacity and HTTP 429 errors get up to three launch attempts per run, with
   30-second then 60-second delays. If they persist, the run fails clearly and
   the next scheduled run can try again.
+- Every attempt for the same launch configuration uses a deterministic OCI
+  `opc_retry_token`. After a network or timeout error, the script checks OCI
+  for the instance before retrying; if it is not visible, any retry reuses that
+  token so OCI can deduplicate an accepted request whose response was lost.
 - Other OCI errors are reported without retrying, to avoid repeating invalid
   requests or authentication failures.
 - Existing resources with the configured name in the configured compartment

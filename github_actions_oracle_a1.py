@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Create one Oracle Cloud A1.Flex instance from a scheduled GitHub Actions run."""
 
+import hashlib
 import json
 import os
 import re
@@ -213,7 +214,7 @@ def validate_image(compute_client, settings):
         )
 
 
-def create_instance(compute_client, settings, oci):
+def create_instance(compute_client, settings, oci, opc_retry_token):
     instance_details = oci.core.models.LaunchInstanceDetails(
         availability_domain=settings.availability_domain,
         compartment_id=settings.compartment_id,
@@ -236,8 +237,38 @@ def create_instance(compute_client, settings, oci):
         metadata={"ssh_authorized_keys": settings.ssh_public_key},
         is_pv_encryption_in_transit_enabled=True,
     )
-    response = compute_client.launch_instance(instance_details)
+    response = compute_client.launch_instance(
+        instance_details,
+        opc_retry_token=opc_retry_token,
+    )
     return response.data
+
+
+def build_launch_retry_token(settings):
+    request_identity = {
+        "region": REGION,
+        "availability_domain": settings.availability_domain,
+        "compartment_id": settings.compartment_id,
+        "display_name": DISPLAY_NAME,
+        "shape": SHAPE,
+        "ocpus": OCPUS,
+        "memory_in_gbs": MEMORY_IN_GBS,
+        "image_id": settings.image_id,
+        "boot_volume_size_in_gbs": BOOT_VOLUME_SIZE_GBS,
+        "boot_volume_vpus_per_gb": BOOT_VOLUME_VPUS_PER_GB,
+        "subnet_id": settings.subnet_id,
+        "assign_public_ip": True,
+        "is_pv_encryption_in_transit_enabled": True,
+        "ssh_public_key_sha256": hashlib.sha256(
+            settings.ssh_public_key.encode("utf-8")
+        ).hexdigest(),
+    }
+    canonical_identity = json.dumps(
+        request_identity,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical_identity).hexdigest()
 
 
 def is_capacity_error(error):
@@ -264,23 +295,59 @@ def is_rate_limit_error(error):
     ).casefold()
 
 
+def is_ambiguous_network_error(error, oci):
+    exception_types = (TimeoutError, ConnectionError, URLError)
+    oci_exceptions = getattr(oci, "exceptions", None)
+    if oci_exceptions:
+        exception_types += tuple(
+            exception_type
+            for name in ("RequestException", "ConnectTimeout")
+            if isinstance(
+                (exception_type := getattr(oci_exceptions, name, None)),
+                type,
+            )
+        )
+    return isinstance(error, exception_types)
+
+
 def launch_with_retries(compute_client, settings, oci):
+    retry_token = build_launch_retry_token(settings)
     for attempt in range(1, MAX_LAUNCH_ATTEMPTS + 1):
         existing = find_existing_instance(compute_client, settings)
         if existing:
             return existing, False
 
         try:
-            return create_instance(compute_client, settings, oci), True
-        except oci.exceptions.ServiceError as error:
-            retryable = is_capacity_error(error) or is_rate_limit_error(error)
+            return create_instance(
+                compute_client,
+                settings,
+                oci,
+                opc_retry_token=retry_token,
+            ), True
+        except Exception as error:
+            is_service_error = isinstance(error, oci.exceptions.ServiceError)
+            if is_service_error:
+                retryable = is_capacity_error(error) or is_rate_limit_error(error)
+                category = "capacity" if is_capacity_error(error) else "rate limit"
+            elif is_ambiguous_network_error(error, oci):
+                log(
+                    "Launch response was ambiguous; checking OCI for the instance "
+                    "before considering another attempt."
+                )
+                existing = find_existing_instance(compute_client, settings)
+                if existing:
+                    return existing, False
+                retryable = True
+                category = "network/timeout"
+            else:
+                raise
+
             if not retryable:
                 raise
             if attempt == MAX_LAUNCH_ATTEMPTS:
                 raise RetryExhausted(error, attempt) from error
 
             delay = RETRY_BASE_SECONDS * (2 ** (attempt - 1))
-            category = "capacity" if is_capacity_error(error) else "rate limit"
             log(
                 f"Launch attempt {attempt}/{MAX_LAUNCH_ATTEMPTS} hit a {category} "
                 f"error; retrying in {delay} seconds."
@@ -375,12 +442,19 @@ def main():
         instance, created = launch_with_retries(compute_client, settings, oci)
     except RetryExhausted as error:
         capacity = is_capacity_error(error.error)
-        label = "capacity" if capacity else "rate-limit"
+        rate_limited = is_rate_limit_error(error.error)
+        label = (
+            "capacity"
+            if capacity
+            else "rate-limit"
+            if rate_limited
+            else "network/timeout"
+        )
         details = safe_error_details(error.error, settings.private_key)
         return finish(
             f"FAILURE: OCI {label} error after {error.attempts} launch attempts. "
             f"{details}. Will retry on the next scheduled run.",
-            1 if capacity else 2,
+            1 if capacity else 2 if rate_limited else 4,
         )
     except ConfigurationError as error:
         return finish(f"FAILURE: {error}", 3)

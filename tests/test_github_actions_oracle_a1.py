@@ -100,13 +100,23 @@ class CreatorTests(unittest.TestCase):
         # Capture the actual model instance through a small explicit client below.
         class CapturingCompute:
             request = None
+            launch_kwargs = None
 
-            def launch_instance(self, request):
+            def launch_instance(self, request, **kwargs):
                 self.request = request
+                self.launch_kwargs = kwargs
                 return SimpleNamespace(data=instance)
 
         compute = CapturingCompute()
-        self.assertIs(creator.create_instance(compute, settings(), oci), instance)
+        retry_token = creator.build_launch_retry_token(settings())
+        self.assertIs(
+            creator.create_instance(compute, settings(), oci, retry_token),
+            instance,
+        )
+        self.assertEqual(
+            compute.launch_kwargs["opc_retry_token"],
+            retry_token,
+        )
         request = compute.request.kwargs
         self.assertEqual(request["shape"], "VM.Standard.A1.Flex")
         self.assertEqual(request["shape_config"].kwargs, {"ocpus": 2, "memory_in_gbs": 12})
@@ -177,6 +187,11 @@ class CreatorTests(unittest.TestCase):
         self.assertTrue(created)
         self.assertEqual(create.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [30, 60])
+        tokens = [
+            call.kwargs["opc_retry_token"]
+            for call in create.call_args_list
+        ]
+        self.assertEqual(tokens, [creator.build_launch_retry_token(settings())] * 3)
 
         existing = SimpleNamespace(id="existing-instance")
         with (
@@ -184,6 +199,91 @@ class CreatorTests(unittest.TestCase):
             patch.object(creator, "create_instance") as create,
         ):
             result, created = creator.launch_with_retries(object(), settings(), oci)
+
+        self.assertIs(result, existing)
+        self.assertFalse(created)
+        create.assert_not_called()
+
+    def test_accepted_but_timed_out_launch_is_found_before_retry(self):
+        class ServiceError(Exception):
+            pass
+
+        existing = SimpleNamespace(
+            id="accepted-instance",
+            display_name=creator.DISPLAY_NAME,
+            lifecycle_state="PROVISIONING",
+        )
+        accepted = {"instance": None}
+
+        def find_instance(compute_client, instance_settings):
+            return accepted["instance"]
+
+        def launch_then_timeout(*args, **kwargs):
+            accepted["instance"] = existing
+            raise TimeoutError("response timed out after OCI accepted launch")
+
+        with (
+            patch.object(
+                creator,
+                "find_existing_instance",
+                side_effect=find_instance,
+            ) as find_existing,
+            patch.object(
+                creator,
+                "create_instance",
+                side_effect=launch_then_timeout,
+            ) as create,
+            patch.object(creator.time, "sleep") as sleep,
+        ):
+            result, created = creator.launch_with_retries(
+                object(),
+                settings(),
+                SimpleNamespace(exceptions=SimpleNamespace(ServiceError=ServiceError)),
+            )
+
+        self.assertIs(result, existing)
+        self.assertFalse(created)
+        create.assert_called_once()
+        self.assertEqual(find_existing.call_count, 2)
+        sleep.assert_not_called()
+
+    def test_timeout_retry_reuses_stable_token(self):
+        class ServiceError(Exception):
+            pass
+
+        launched = SimpleNamespace(id="new-instance")
+        with (
+            patch.object(creator, "find_existing_instance", return_value=None),
+            patch.object(
+                creator,
+                "create_instance",
+                side_effect=[TimeoutError("read timed out"), launched],
+            ) as create,
+            patch.object(creator.time, "sleep") as sleep,
+        ):
+            result, created = creator.launch_with_retries(
+                object(),
+                settings(),
+                SimpleNamespace(exceptions=SimpleNamespace(ServiceError=ServiceError)),
+            )
+
+        self.assertIs(result, launched)
+        self.assertTrue(created)
+        tokens = [call.kwargs["opc_retry_token"] for call in create.call_args_list]
+        self.assertEqual(tokens, [creator.build_launch_retry_token(settings())] * 2)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [30])
+
+    def test_preexisting_instance_prevents_launch(self):
+        existing = SimpleNamespace(id="existing-instance")
+        with (
+            patch.object(creator, "find_existing_instance", return_value=existing),
+            patch.object(creator, "create_instance") as create,
+        ):
+            result, created = creator.launch_with_retries(
+                object(),
+                settings(),
+                SimpleNamespace(exceptions=SimpleNamespace(ServiceError=Exception)),
+            )
 
         self.assertIs(result, existing)
         self.assertFalse(created)
