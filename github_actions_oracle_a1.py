@@ -1,127 +1,222 @@
 #!/usr/bin/env python3
-"""
-Oracle Cloud A1.Flex One-Shot Creator
-=======================================
-Tries to create the VM.Standard.A1.Flex instance ONCE.
-Designed for GitHub Actions (runs every 5 minutes via cron schedule).
+"""Create one Oracle Cloud A1.Flex instance from a scheduled GitHub Actions run."""
 
-Exit codes:
-    0 = Instance created successfully (or already exists)
-    1 = Out of capacity (will retry on next GitHub Actions run)
-    2 = Rate limited 429 (will retry on next run)
-    3 = Config/auth error (needs manual fix)
-    4 = Unexpected error (will retry on next run)
-
-Environment variables (set via GitHub Secrets):
-    OCI_USER_OCID          - Your OCI User OCID
-    OCI_TENANCY_OCID       - Your OCI Tenancy OCID
-    OCI_FINGERPRINT        - API Key fingerprint
-    OCI_PRIVATE_KEY        - Full contents of your .pem private key
-    OCI_REGION             - e.g., ap-hyderabad-1
-    OCI_COMPARTMENT_ID     - Compartment OCID (usually = tenancy OCID)
-    OCI_AVAILABILITY_DOMAIN - Full AD name, e.g., Cwfi:AP-HYDERABAD-1-AD-1
-    OCI_SUBNET_ID          - Subnet OCID
-    OCI_IMAGE_ID           - ARM image OCID
-    SSH_PUBLIC_KEY         - Contents of your SSH public key
-    
-Optional notifications (also via GitHub Secrets):
-    DISCORD_WEBHOOK_URL    - Send success message to Discord
-    TELEGRAM_TOKEN         - Telegram bot token
-    TELEGRAM_USER_ID       - Your Telegram user ID
-"""
-
+import json
 import os
+import re
 import sys
-import traceback
-from datetime import datetime
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from urllib.error import URLError
+from urllib.request import Request, urlopen
 
-# ---------------------------------------------------------------------------
-#  CONFIGURATION — reads from environment variables (GitHub Secrets)
-# ---------------------------------------------------------------------------
-
-def get_env(name, required=True):
-    val = os.environ.get(name, "")
-    if required and not val:
-        print(f"ERROR: Missing required environment variable: {name}")
-        sys.exit(3)
-    return val
-
-# OCI Config (built from env vars instead of file)
-OCI_USER_OCID = get_env("OCI_USER_OCID")
-OCI_TENANCY_OCID = get_env("OCI_TENANCY_OCID")
-OCI_FINGERPRINT = get_env("OCI_FINGERPRINT")
-OCI_PRIVATE_KEY = get_env("OCI_PRIVATE_KEY")
-OCI_REGION = get_env("OCI_REGION")
-
-COMPARTMENT_ID = get_env("OCI_COMPARTMENT_ID")
-AVAILABILITY_DOMAIN = get_env("OCI_AVAILABILITY_DOMAIN")
-SUBNET_ID = get_env("OCI_SUBNET_ID")
-IMAGE_ID = get_env("OCI_IMAGE_ID")
-SSH_PUBLIC_KEY = get_env("SSH_PUBLIC_KEY")
-
+REGION = "ap-mumbai-1"
 SHAPE = "VM.Standard.A1.Flex"
-OCPUS = 2  # or 4 if you want in 1 instance
-MEMORY_IN_GBS = 12 
-BOOT_VOLUME_SIZE = 50
+OCPUS = 2
+MEMORY_IN_GBS = 12
+BOOT_VOLUME_SIZE_GBS = 100
+BOOT_VOLUME_VPUS_PER_GB = 10
 DISPLAY_NAME = "free-tier-arm-a1"
-
-DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK_URL", "")
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_USER_ID = os.environ.get("TELEGRAM_USER_ID", "")
-
-# ---------------------------------------------------------------------------
+MAX_LAUNCH_ATTEMPTS = 3
+RETRY_BASE_SECONDS = 30
 
 
-def log(msg):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {msg}")
+class ConfigurationError(Exception):
+    """Raised when required environment configuration is missing or invalid."""
 
 
-def send_discord(message):
-    if not DISCORD_WEBHOOK:
-        return
-    try:
-        import requests
-        requests.post(DISCORD_WEBHOOK, json={"content": message}, timeout=10)
-    except Exception as e:
-        log(f"Discord notification failed: {e}")
+class RetryExhausted(Exception):
+    def __init__(self, error, attempts):
+        super().__init__("Retryable launch error after all attempts")
+        self.error = error
+        self.attempts = attempts
 
 
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_USER_ID:
-        return
-    try:
-        import requests
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_USER_ID, "text": message}, timeout=10)
-    except Exception as e:
-        log(f"Telegram notification failed: {e}")
+@dataclass(frozen=True)
+class Settings:
+    user_ocid: str
+    tenancy_ocid: str
+    fingerprint: str
+    private_key: str
+    compartment_id: str
+    availability_domain: str
+    subnet_id: str
+    image_id: str
+    ssh_public_key: str
 
 
-def notify(message):
-    log(message)
-    send_discord(message)
-    send_telegram(message)
+def log(message):
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"[{timestamp}] {message}", flush=True)
 
 
-def build_oci_config():
-    """Build OCI config dict from environment variables."""
+def load_settings(environ=None):
+    environ = os.environ if environ is None else environ
+    required = (
+        "OCI_USER_OCID",
+        "OCI_TENANCY_OCID",
+        "OCI_FINGERPRINT",
+        "OCI_PRIVATE_KEY",
+        "OCI_COMPARTMENT_ID",
+        "OCI_AVAILABILITY_DOMAIN",
+        "OCI_SUBNET_ID",
+        "OCI_IMAGE_ID",
+        "SSH_PUBLIC_KEY",
+    )
+    values = {name: environ.get(name, "").strip() for name in required}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise ConfigurationError(
+            "Missing required GitHub Actions secret(s): " + ", ".join(missing)
+        )
+
+    availability_domain = values["OCI_AVAILABILITY_DOMAIN"]
+    if not availability_domain.upper().endswith(":AP-MUMBAI-1-AD-1"):
+        raise ConfigurationError(
+            "OCI_AVAILABILITY_DOMAIN must be the full AD-1 name for ap-mumbai-1 "
+            "(for example, <tenancy-prefix>:AP-MUMBAI-1-AD-1)."
+        )
+
+    return Settings(
+        user_ocid=values["OCI_USER_OCID"],
+        tenancy_ocid=values["OCI_TENANCY_OCID"],
+        fingerprint=values["OCI_FINGERPRINT"],
+        private_key=values["OCI_PRIVATE_KEY"],
+        compartment_id=values["OCI_COMPARTMENT_ID"],
+        availability_domain=availability_domain,
+        subnet_id=values["OCI_SUBNET_ID"],
+        image_id=values["OCI_IMAGE_ID"],
+        ssh_public_key=values["SSH_PUBLIC_KEY"],
+    )
+
+
+def build_oci_config(settings):
     return {
-        "user": OCI_USER_OCID,
-        "tenancy": OCI_TENANCY_OCID,
-        "fingerprint": OCI_FINGERPRINT,
-        "key_content": OCI_PRIVATE_KEY,
-        "region": OCI_REGION,
+        "user": settings.user_ocid,
+        "tenancy": settings.tenancy_ocid,
+        "fingerprint": settings.fingerprint,
+        "key_content": settings.private_key,
+        "region": REGION,
     }
 
 
-def create_instance(compute_client, network_client):
-    """Attempt to create the A1.Flex instance."""
-    import oci
+def set_action_output(name, value):
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    try:
+        with open(output_path, "a", encoding="utf-8") as output_file:
+            output_file.write(f"{name}={value}\n")
+    except OSError as error:
+        log(f"ERROR: Could not write GitHub Actions output ({error.__class__.__name__}).")
 
+
+def write_action_summary(message):
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    try:
+        with open(summary_path, "a", encoding="utf-8") as summary_file:
+            summary_file.write(f"## Oracle A1.Flex creator\n\n{message}\n")
+    except OSError as error:
+        log(f"ERROR: Could not write GitHub Actions summary ({error.__class__.__name__}).")
+
+
+def _post_json(url, payload, service_name, expect_json=False):
+    try:
+        request = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=10) as response:
+            response_body = response.read()
+        if expect_json:
+            result = json.loads(response_body)
+            if not isinstance(result, dict) or not result.get("ok"):
+                log(f"{service_name} notification was rejected by the service.")
+    except (URLError, TimeoutError, OSError, ValueError) as error:
+        log(f"{service_name} notification failed ({error.__class__.__name__}).")
+
+
+def send_notifications(message):
+    discord_webhook = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
+    if discord_webhook:
+        _post_json(
+            discord_webhook,
+            {"content": message},
+            "Discord",
+        )
+
+    telegram_token = os.environ.get("TELEGRAM_TOKEN", "").strip()
+    telegram_user_id = os.environ.get("TELEGRAM_USER_ID", "").strip()
+    if telegram_token and telegram_user_id:
+        _post_json(
+            f"https://api.telegram.org/bot{telegram_token}/sendMessage",
+            {"chat_id": telegram_user_id, "text": message},
+            "Telegram",
+            expect_json=True,
+        )
+    elif telegram_token or telegram_user_id:
+        log("Telegram notification skipped: both TELEGRAM_TOKEN and TELEGRAM_USER_ID are required.")
+
+
+def finish(message, exit_code, instance_found=False):
+    log(message)
+    if instance_found:
+        set_action_output("instance_found", "true")
+    write_action_summary(message)
+    send_notifications(message)
+    return exit_code
+
+
+def find_existing_instance(compute_client, settings):
+    page = None
+    while True:
+        params = {
+            "compartment_id": settings.compartment_id,
+            "availability_domain": settings.availability_domain,
+            "display_name": DISPLAY_NAME,
+        }
+        if page:
+            params["page"] = page
+        response = compute_client.list_instances(**params)
+        for instance in response.data:
+            if instance.display_name == DISPLAY_NAME:
+                return instance
+        page = response.headers.get("opc-next-page")
+        if not page:
+            return None
+
+
+def validate_image(compute_client, settings):
+    image = compute_client.get_image(settings.image_id).data
+    operating_system = (image.operating_system or "").strip().casefold()
+    version = (image.operating_system_version or "").strip()
+    if operating_system not in {"canonical ubuntu", "ubuntu"} or not re.fullmatch(
+        r"24\.04(?:\.\d+)?", version
+    ):
+        raise ConfigurationError(
+            "OCI_IMAGE_ID must identify an Ubuntu 24.04 image; "
+            f"the selected image reports {image.operating_system!r} {version!r}."
+        )
+
+    shapes = compute_client.list_shapes(
+        compartment_id=settings.compartment_id,
+        image_id=settings.image_id,
+    ).data
+    if not any(shape.shape == SHAPE for shape in shapes):
+        raise ConfigurationError(
+            f"OCI_IMAGE_ID is not compatible with {SHAPE}; select an Ubuntu 24.04 ARM64 image."
+        )
+
+
+def create_instance(compute_client, settings, oci):
     instance_details = oci.core.models.LaunchInstanceDetails(
-        availability_domain=AVAILABILITY_DOMAIN,
-        compartment_id=COMPARTMENT_ID,
+        availability_domain=settings.availability_domain,
+        compartment_id=settings.compartment_id,
         shape=SHAPE,
         display_name=DISPLAY_NAME,
         shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
@@ -129,134 +224,220 @@ def create_instance(compute_client, network_client):
             memory_in_gbs=MEMORY_IN_GBS,
         ),
         source_details=oci.core.models.InstanceSourceViaImageDetails(
-            image_id=IMAGE_ID,
-            boot_volume_vpus_per_gb=120,
-            boot_volume_size_in_gbs=BOOT_VOLUME_SIZE,
+            image_id=settings.image_id,
+            boot_volume_vpus_per_gb=BOOT_VOLUME_VPUS_PER_GB,
+            boot_volume_size_in_gbs=BOOT_VOLUME_SIZE_GBS,
         ),
         create_vnic_details=oci.core.models.CreateVnicDetails(
-            subnet_id=SUBNET_ID,
+            subnet_id=settings.subnet_id,
             assign_public_ip=True,
             display_name=f"{DISPLAY_NAME}-vnic",
         ),
-        metadata={
-            "ssh_authorized_keys": SSH_PUBLIC_KEY,
-        },
-        is_pv_encryption_in_transit_enabled=False,
+        metadata={"ssh_authorized_keys": settings.ssh_public_key},
+        is_pv_encryption_in_transit_enabled=True,
     )
-
     response = compute_client.launch_instance(instance_details)
-    instance = response.data
-    log(f"SUCCESS! Instance created: {instance.id}")
-    log(f"  Name: {instance.display_name}")
-    log(f"  AD:   {instance.availability_domain}")
-    log(f"  State: {instance.lifecycle_state}")
-    return instance
-
-
-def wait_for_running(compute_client, instance_id):
-    """Wait until instance is RUNNING and return public IP."""
-    import oci
-
-    log("Waiting for RUNNING state...")
-    for _ in range(30):  # max 5 minutes
-        instance = compute_client.get_instance(instance_id).data
-        state = instance.lifecycle_state
-        log(f"  State: {state}")
-        if state == "RUNNING":
-            break
-        if state in ("TERMINATED", "TERMINATING"):
-            log("ERROR: Instance terminated.")
-            return None
-        import time
-        time.sleep(10)
-
-    # Get public IP
-    vnic_attachments = compute_client.list_vnic_attachments(
-        compartment_id=COMPARTMENT_ID,
-        instance_id=instance_id,
-    ).data
-
-    for vnic_att in vnic_attachments:
-        try:
-            import oci
-            vnic = oci.core.VirtualNetworkClient(build_oci_config()).get_vnic(vnic_att.vnic_id).data
-            if vnic.public_ip:
-                return vnic.public_ip
-        except:
-            pass
-
-    return None
+    return response.data
 
 
 def is_capacity_error(error):
-    msg = str(error).lower()
-    return any(phrase in msg for phrase in [
-        "out of capacity", "out of host capacity", "capacity", "no available host"
-    ])
+    message = " ".join(
+        (
+            str(getattr(error, "code", "")),
+            str(getattr(error, "message", "")),
+        )
+    ).casefold()
+    return any(
+        phrase in message
+        for phrase in (
+            "out of capacity",
+            "out of host capacity",
+            "no available host",
+            "capacity is unavailable",
+        )
+    )
 
 
 def is_rate_limit_error(error):
-    return getattr(error, "status", 0) == 429 or "too many requests" in str(error).lower()
+    return getattr(error, "status", None) == 429 or "too many requests" in str(
+        getattr(error, "message", "")
+    ).casefold()
+
+
+def launch_with_retries(compute_client, settings, oci):
+    for attempt in range(1, MAX_LAUNCH_ATTEMPTS + 1):
+        existing = find_existing_instance(compute_client, settings)
+        if existing:
+            return existing, False
+
+        try:
+            return create_instance(compute_client, settings, oci), True
+        except oci.exceptions.ServiceError as error:
+            retryable = is_capacity_error(error) or is_rate_limit_error(error)
+            if not retryable:
+                raise
+            if attempt == MAX_LAUNCH_ATTEMPTS:
+                raise RetryExhausted(error, attempt) from error
+
+            delay = RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            category = "capacity" if is_capacity_error(error) else "rate limit"
+            log(
+                f"Launch attempt {attempt}/{MAX_LAUNCH_ATTEMPTS} hit a {category} "
+                f"error; retrying in {delay} seconds."
+            )
+            time.sleep(delay)
+
+    raise AssertionError("Launch retry loop exited unexpectedly.")
+
+
+def wait_for_running(compute_client, network_client, settings, instance_id):
+    log("Waiting up to five minutes for the instance to reach RUNNING.")
+    deadline = time.monotonic() + 300
+    state = "PROVISIONING"
+    while time.monotonic() < deadline:
+        instance = compute_client.get_instance(instance_id).data
+        state = instance.lifecycle_state
+        log(f"Instance state: {state}")
+        if state == "RUNNING":
+            break
+        if state in {"TERMINATED", "TERMINATING"}:
+            return state, None
+        time.sleep(min(10, max(0, deadline - time.monotonic())))
+
+    if state != "RUNNING":
+        return state, None
+
+    attachments = compute_client.list_vnic_attachments(
+        compartment_id=settings.compartment_id,
+        instance_id=instance_id,
+    ).data
+    for attachment in attachments:
+        vnic = network_client.get_vnic(attachment.vnic_id).data
+        if vnic.public_ip:
+            return state, vnic.public_ip
+    return state, None
+
+
+def safe_error_details(error, private_key=""):
+    status = getattr(error, "status", None)
+    code = getattr(error, "code", None)
+    message = getattr(error, "message", None)
+    if message:
+        details = f"{message}"
+    else:
+        details = error.__class__.__name__
+    if status is not None or code:
+        details = f"OCI status={status or 'unknown'}, code={code or 'unknown'}: {details}"
+    if private_key:
+        details = details.replace(private_key, "[REDACTED]")
+    return details
+
+
+def error_exit_code(error):
+    if getattr(error, "status", None) in {400, 401, 403, 404}:
+        return 3
+    return 4
 
 
 def main():
     try:
+        settings = load_settings()
+    except ConfigurationError as error:
+        return finish(f"FAILURE: {error}", 3)
+
+    try:
         import oci
     except ImportError:
-        log("ERROR: oci SDK not installed. Run: pip install oci")
-        return 3
-
-    config = build_oci_config()
+        return finish("FAILURE: OCI Python SDK is not installed.", 3)
 
     try:
+        config = build_oci_config(settings)
         compute_client = oci.core.ComputeClient(config)
         network_client = oci.core.VirtualNetworkClient(config)
-    except Exception as e:
-        log(f"ERROR: Failed to initialize OCI clients: {e}")
-        return 3
+    except Exception as error:
+        return finish(
+            f"FAILURE: Could not initialize OCI clients ({error.__class__.__name__}).",
+            3,
+        )
 
-    log("=" * 60)
-    log("Oracle A1.Flex One-Shot Creator")
-    log(f"Shape: {SHAPE} ({OCPUS} OCPU, {MEMORY_IN_GBS} GB)")
-    log(f"Region: {OCI_REGION}")
-    log(f"AD: {AVAILABILITY_DOMAIN}")
-    log("=" * 60)
+    log(f"Target: {SHAPE}, {OCPUS} OCPU / {MEMORY_IN_GBS} GB RAM, {REGION}, AD-1")
 
     try:
-        instance = create_instance(compute_client, network_client)
-        public_ip = wait_for_running(compute_client, instance.id)
+        existing = find_existing_instance(compute_client, settings)
+        if existing:
+            message = (
+                "SUCCESS: An instance with the configured name already exists; "
+                f"no creation attempted. ID: {existing.id}, state: {existing.lifecycle_state}."
+            )
+            return finish(message, 0, instance_found=True)
 
-        msg = f"🎉 Oracle A1.Flex instance CREATED!\n"
-        msg += f"Instance ID: {instance.id}\n"
-        msg += f"Name: {instance.display_name}\n"
-        msg += f"AD: {instance.availability_domain}\n"
-        if public_ip:
-            msg += f"Public IP: {public_ip}\n"
-            msg += f"SSH: ssh -i ~/.ssh/id_rsa ubuntu@{public_ip}"
-        else:
-            msg += "Public IP: Check Oracle Console"
+        validate_image(compute_client, settings)
+        instance, created = launch_with_retries(compute_client, settings, oci)
+    except RetryExhausted as error:
+        capacity = is_capacity_error(error.error)
+        label = "capacity" if capacity else "rate-limit"
+        details = safe_error_details(error.error, settings.private_key)
+        return finish(
+            f"FAILURE: OCI {label} error after {error.attempts} launch attempts. "
+            f"{details}. Will retry on the next scheduled run.",
+            1 if capacity else 2,
+        )
+    except ConfigurationError as error:
+        return finish(f"FAILURE: {error}", 3)
+    except Exception as error:
+        return finish(
+            f"FAILURE: OCI request failed. {safe_error_details(error, settings.private_key)}",
+            error_exit_code(error),
+        )
 
-        notify(msg)
-        return 0
+    if not created:
+        message = (
+            "SUCCESS: An instance with the configured name already exists; "
+            f"no creation attempted. ID: {instance.id}, state: {instance.lifecycle_state}."
+        )
+        return finish(message, 0, instance_found=True)
 
-    except oci.exceptions.ServiceError as e:
-        if is_rate_limit_error(e):
-            log(f"Rate limited (429). Will retry on next scheduled run.")
-            return 2
-        elif is_capacity_error(e):
-            log(f"Out of capacity ({e.status}). Will retry on next scheduled run.")
-            return 1
-        else:
-            log(f"ServiceError {e.status}: {e.message}")
-            if e.status in (401, 400):
-                log("ERROR: Authentication/config issue. Check your secrets.")
-                return 3
-            return 4
+    try:
+        state, public_ip = wait_for_running(
+            compute_client,
+            network_client,
+            settings,
+            instance.id,
+        )
+        if state in {"TERMINATED", "TERMINATING"}:
+            message = (
+                f"FAILURE: Instance {instance.id} was created but is now {state}. "
+                "No further creation attempts will be made automatically."
+            )
+            return finish(message, 4, instance_found=True)
+    except Exception as error:
+        state = "unknown"
+        public_ip = None
+        log(
+            "WARNING: Instance launch succeeded, but its final state could not be "
+            f"verified ({safe_error_details(error, settings.private_key)})."
+        )
 
-    except Exception as e:
-        log(f"Unexpected error: {e}")
-        traceback.print_exc()
-        return 4
+    details = [
+        "SUCCESS: Oracle A1.Flex instance created.",
+        f"Instance ID: {instance.id}",
+        f"Name: {instance.display_name}",
+        f"Availability domain: {instance.availability_domain}",
+        f"Shape: {SHAPE} ({OCPUS} OCPU, {MEMORY_IN_GBS} GB RAM)",
+        f"Boot volume: {BOOT_VOLUME_SIZE_GBS} GB, {BOOT_VOLUME_VPUS_PER_GB} VPU/GB",
+        f"Lifecycle state: {state}",
+    ]
+    if public_ip:
+        details.extend(
+            (
+                f"Public IPv4: {public_ip}",
+                f"SSH: ssh -i <private-key-file> ubuntu@{public_ip}",
+            )
+        )
+    else:
+        details.append("Public IPv4: not available yet; check the OCI Console.")
+    details.append("The GitHub Actions workflow will be disabled automatically.")
+    return finish("\n".join(details), 0, instance_found=True)
 
 
 if __name__ == "__main__":

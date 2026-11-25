@@ -2,18 +2,21 @@ name: Oracle A1.Flex Instance Creator
 
 on:
   schedule:
-    # Run every 10 minutes (conservative to stay within free tier limits)
-    # Free tier: 2,000 minutes/month. 
-    # ~144 runs/day × 30 days = 4,320 runs/month
-    # Each run is ~5-10 seconds on failure = ~360-720 min/month total
-    # Adjust to '*/5 * * * *' if you want more aggressive polling
-    - cron: '*/5 * * * *'
-  workflow_dispatch:  # Allow manual trigger from GitHub UI
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: oracle-a1-creator
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
   create-instance:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Checkout repo
@@ -25,15 +28,15 @@ jobs:
           python-version: '3.11'
 
       - name: Install OCI SDK
-        run: pip install oci requests
+        run: python -m pip install --upgrade oci
 
       - name: Run A1.Flex creator
+        id: creator
         env:
           OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
           OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
           OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
           OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
-          OCI_REGION: ${{ secrets.OCI_REGION }}
           OCI_COMPARTMENT_ID: ${{ secrets.OCI_COMPARTMENT_ID }}
           OCI_AVAILABILITY_DOMAIN: ${{ secrets.OCI_AVAILABILITY_DOMAIN }}
           OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
@@ -43,9 +46,16 @@ jobs:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_USER_ID: ${{ secrets.TELEGRAM_USER_ID }}
         run: python github_actions_oracle_a1.py
-        continue-on-error: true
 
-      - name: Check result
+      - name: Disable workflow after instance is found
+        if: always() && steps.creator.outputs.instance_found == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable oracle-a1-creator.yml --repo "$GITHUB_REPOSITORY"
+
+      - name: Record workflow failure
         if: failure()
         run: |
-          echo "Instance creation failed. Will retry in next scheduled run (5 minutes)."
+          echo "## Oracle A1.Flex creator failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Review the creator step logs and configured GitHub Actions Secrets. Scheduled runs will retry unless the workflow was disabled after an instance was found." >> "$GITHUB_STEP_SUMMARY"

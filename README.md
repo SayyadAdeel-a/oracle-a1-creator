@@ -1,206 +1,161 @@
 # Oracle Cloud A1.Flex Auto-Creator
 
-> Automatically provision Oracle Cloud's free VM.Standard.A1.Flex instance (4 OCPU / 24 GB RAM) using GitHub Actions — runs 24/7 without your laptop.
+This repository contains a GitHub Actions workflow that attempts to create one
+Oracle Cloud Infrastructure (OCI) `VM.Standard.A1.Flex` instance. It retries
+capacity and rate-limit errors, checks for an existing instance before
+launching, and disables its own workflow after an instance is found or
+successfully launched.
 
-![Oracle Cloud](https://img.shields.io/badge/Oracle%20Cloud-Free%20Tier-red)
-![GitHub Actions](https://img.shields.io/badge/GitHub%20Actions-Automated-blue)
-![Python](https://img.shields.io/badge/Python-3.11-green)
-![License](https://img.shields.io/badge/License-MIT-yellow)
+OCI capacity is not guaranteed. Charges may apply if your tenancy, region,
+resource usage, or boot-volume settings are outside current Always Free
+eligibility. Review OCI pricing and your tenancy's usage before enabling this
+workflow.
 
----
+## Provisioned configuration
 
-## What This Does
+The target values are set in `github_actions_oracle_a1.py`:
 
-Oracle Cloud's Always Free tier includes a powerful ARM instance:
+| Setting | Value |
+|---|---|
+| Region | `ap-mumbai-1` (Mumbai) |
+| Availability domain | AD-1 in Mumbai |
+| Shape | `VM.Standard.A1.Flex` |
+| OCPUs | 2 |
+| Memory | 12 GB |
+| Image | Ubuntu 24.04, ARM64 (verified before launch) |
+| Boot volume | 100 GB, 10 VPU/GB |
+| In-transit encryption | Enabled |
+| Public IPv4 | Enabled on the instance VNIC |
 
-| Spec | Value |
-|------|-------|
-| **Shape** | `VM.Standard.A1.Flex` |
-| **CPU** | 4 OCPU (Ampere ARM) |
-| **RAM** | 24 GB |
-| **Boot Volume** | 200 GB (total across all instances) |
-| **Cost** | $0 forever |
+The selected subnet must be public and have a route to an Internet Gateway for
+the public IP to be reachable. Configure subnet security rules separately; for
+SSH, allow TCP port 22 only from trusted source addresses.
 
-The catch? **It's always out of capacity.** Thousands of users compete for the same free slots. This project solves that by polling Oracle's API every 10 minutes — 24/7, running on GitHub's infrastructure — and instantly grabs an instance the moment capacity frees up.
+## Setup
 
----
+### 1. Prepare OCI
 
-## How It Works
+1. In the Mumbai home region, create or select a compartment, VCN, public
+   subnet, SSH key pair, and an Ubuntu 24.04 ARM64 image.
+2. Copy the full availability-domain **name** for Mumbai AD-1. It is usually
+   formatted like `<tenancy-prefix>:AP-MUMBAI-1-AD-1`; it is not an OCID.
+3. Create an OCI API signing key for the OCI user and record its fingerprint.
+   Keep the private key private.
+4. Ensure the OCI user belongs to a group with the following permissions in
+   the target compartment (replace the placeholders):
 
+   ```text
+   Allow group <group-name> to manage instance-family in compartment <compartment-name>
+   Allow group <group-name> to use virtual-network-family in compartment <compartment-name>
+   ```
+
+   `manage instance-family` permits listing instances, checking images and
+   compatible shapes, and launching an instance. `use virtual-network-family`
+   permits using the subnet and looking up the instance VNIC.
+
+### 2. Add GitHub Actions Secrets
+
+Open **Settings → Secrets and variables → Actions → New repository secret** and
+add the required secrets:
+
+| Secret | Value |
+|---|---|
+| `OCI_USER_OCID` | OCI API-signing user OCID |
+| `OCI_TENANCY_OCID` | Tenancy OCID |
+| `OCI_FINGERPRINT` | Fingerprint of that user's API signing key |
+| `OCI_PRIVATE_KEY` | Full contents of the OCI API signing private-key PEM |
+| `OCI_COMPARTMENT_ID` | OCID of the target compartment |
+| `OCI_AVAILABILITY_DOMAIN` | Full Mumbai AD-1 name, e.g. `<prefix>:AP-MUMBAI-1-AD-1` |
+| `OCI_SUBNET_ID` | OCID of the public subnet |
+| `OCI_IMAGE_ID` | Mumbai-region OCID of an Ubuntu 24.04 ARM64 image |
+| `SSH_PUBLIC_KEY` | Public SSH key to install for the `ubuntu` user |
+
+The region is fixed to `ap-mumbai-1` in the script, so no `OCI_REGION` secret
+is used. The script checks the selected image's Ubuntu version and whether it
+supports `VM.Standard.A1.Flex` before attempting a launch.
+
+Optional success/failure notifications:
+
+| Secret | Value |
+|---|---|
+| `DISCORD_WEBHOOK_URL` | Discord webhook URL |
+| `TELEGRAM_TOKEN` | Telegram bot token |
+| `TELEGRAM_USER_ID` | Telegram chat/user ID |
+
+Set both Telegram secrets to enable Telegram notifications. Do not put an OCI
+private key or SSH private key in source code, workflow YAML, logs, or the
+repository. GitHub Secrets inject the OCI API private key only at runtime. The
+SSH private key stays with you; only its public key is supplied as
+`SSH_PUBLIC_KEY`.
+
+### 3. Enable the workflow
+
+Enable **Actions** for the repository, then run **Oracle A1.Flex Instance
+Creator** manually once from the Actions tab. Scheduled runs use the default
+branch and occur every 10 minutes (`*/10 * * * *`); GitHub may delay scheduled
+events during high load. The workflow has a repository-wide concurrency group
+to prevent overlapping runs.
+
+The Actions workflow needs these repository permissions:
+
+- `contents: read` to check out the source.
+- `actions: write` so it can disable itself after an instance is found or
+  created.
+
+Once an instance is found or launched, the workflow disables itself. If GitHub
+cannot disable it, the disable step fails visibly; disable the workflow
+manually in the Actions tab. The script also checks for the named instance
+before every launch attempt, so subsequent runs do not create another instance
+while that OCI resource is present.
+
+## Retry and result behavior
+
+- Capacity and HTTP 429 errors get up to three launch attempts per run, with
+  30-second then 60-second delays. If they persist, the run fails clearly and
+  the next scheduled run can try again.
+- Other OCI errors are reported without retrying, to avoid repeating invalid
+  requests or authentication failures.
+- Existing resources with the configured name in the configured compartment
+  and AD are treated as success, including resources that are terminating or
+  terminated. This prevents a second launch if the workflow is manually
+  re-enabled.
+- A successful launch is monitored for up to five minutes. If OCI has not
+  assigned a public IP yet, the success message directs you to the OCI Console.
+- Success/failure is written to the Actions log and job summary. Discord and
+  Telegram notifications are optional.
+
+Exit codes:
+
+| Code | Meaning |
+|---:|---|
+| `0` | Instance launched or matching instance already exists |
+| `1` | Capacity retries exhausted |
+| `2` | Rate-limit retries exhausted |
+| `3` | Missing/invalid configuration, OCI SDK, or authentication setup |
+| `4` | Other OCI failure |
+
+## Validate locally
+
+The focused unit tests use mocks and do not require OCI credentials or the OCI
+SDK:
+
+```bash
+python -m unittest discover -s tests -v
 ```
-┌─────────────────┐     ┌──────────────┐     ┌─────────────────┐
-│  GitHub Actions │────▶│  OCI Python  │────▶│  Oracle Cloud   │
-│  Every 10 min   │     │  SDK + API   │     │  Create Instance│
-└─────────────────┘     └──────────────┘     └─────────────────┘
-         │                                              │
-         │◀─────────────────────────────────────────────┘
-         │           Out of capacity? → Retry in 10 min
-         │           Success? → 🎉 Notify & stop
-         │
-         ▼
-    Discord / Telegram
-    (optional notification)
-```
-
-**Why this works:**
-- No infinite loop → no rate limit issues
-- Each run is spaced 10 minutes apart → Oracle's API is happy
-- GitHub Actions runs 24/7 → no laptop needed
-- Completely free (within 2,000 GitHub minutes/month)
-
----
-
-## Quick Start
-
-### 1. Fork or Create This Repo
-
-Click **"Use this template"** or create a new repo and push these files.
-
-### 2. Add GitHub Secrets
-
-Go to **Settings → Secrets and variables → Actions → New repository secret**
-
-| Secret | Description | Where to Find |
-|--------|-------------|---------------|
-| `OCI_USER_OCID` | Your OCI user ID | Profile → User Settings → Copy OCID |
-| `OCI_TENANCY_OCID` | Your tenancy ID | Same as Compartment ID for root |
-| `OCI_FINGERPRINT` | API key fingerprint | Profile → API Keys → looks like `aa:bb:cc:dd...` |
-| `OCI_PRIVATE_KEY` | Full `.pem` private key | Open your `.pem` file, copy ALL text |
-| `OCI_REGION` | Your region | e.g., `ap-hyderabad-1` |
-| `OCI_COMPARTMENT_ID` | Compartment OCID | Usually same as Tenancy OCID |
-| `OCI_AVAILABILITY_DOMAIN` | Full AD name | Console → Administration → ADs |
-| `OCI_SUBNET_ID` | Subnet OCID | Networking → VCN → Subnets |
-| `OCI_IMAGE_ID` | ARM (aarch64) image OCID | Must be ARM-compatible for A1.Flex |
-| `SSH_PUBLIC_KEY` | Your SSH public key | `~/.ssh/id_rsa.pub` |
-
-**Optional notifications:**
-| Secret | Description |
-|--------|-------------|
-| `DISCORD_WEBHOOK_URL` | Discord webhook for success notifications |
-| `TELEGRAM_TOKEN` | Telegram bot token (@BotFather) |
-| `TELEGRAM_USER_ID` | Your Telegram user ID (@myidbot) |
-
-### 3. Enable the Workflow
-
-1. Go to **Actions** tab
-2. Click **"Enable workflows"** if prompted
-3. Click **"Oracle A1.Flex Instance Creator"**
-4. Click **"Run workflow"** → **"Run workflow"**
-
-### 4. Wait & Watch
-
-The workflow runs automatically every 10 minutes. Check the logs to see:
-- `Out of capacity (500)` → Normal, will retry
-- `Rate limited (429)` → Also normal, will retry
-- `SUCCESS! Instance created` → 🎉 You got it!
-
-### 5. After Success
-
-1. **Disable the workflow** → Actions → Disable (stops burning minutes)
-2. SSH into your instance: `ssh -i ~/.ssh/id_rsa ubuntu@<PUBLIC_IP>`
-3. Optionally delete this repo (or keep it for future use)
-
----
-
-## Project Structure
-
-```
-.
-├── .github/
-│   └── workflows/
-│       └── oracle-a1-creator.yml    # GitHub Actions workflow (runs every 10 min)
-├── github_actions_oracle_a1.py     # Main Python script (one-shot creator)
-├── README.md                        # This file
-├── LICENSE                          # MIT License
-└── .gitignore                       # Ignore sensitive files
-```
-
----
-
-## Architecture
-
-### Why One-Shot Instead of Infinite Loop?
-
-| Approach | Problem | This Solution |
-|----------|---------|---------------|
-| Infinite loop on laptop | Laptop must stay on, rate limits after 30s | GitHub Actions runs 24/7 |
-| Infinite loop on server | Need a server first, rate limits from aggressive retry | 10-minute spacing = no rate limits |
-| Manual clicking | Impossible to catch capacity drops | Automated, always watching |
-
-### Exit Codes
-
-The script returns specific exit codes so GitHub Actions knows what happened:
-
-| Code | Meaning | Action |
-|------|---------|--------|
-| `0` | Success! Instance created | 🎉 Stop workflow, send notification |
-| `1` | Out of capacity | Retry in next scheduled run |
-| `2` | Rate limited (429) | Retry in next scheduled run |
-| `3` | Config/auth error | Needs manual fix |
-| `4` | Unexpected error | Will retry |
-
----
-
-## Free Tier Limits
-
-**GitHub Actions:**
-- Public repos: 2,000 minutes/month
-- This workflow: ~144 runs/day × 30 days = ~4,320 runs/month
-- Each run: ~5-30 seconds on failure
-- Total: ~360-720 minutes/month ✅ well within limits
-
-**Oracle Cloud Always Free:**
-- 4 OCPU + 24 GB RAM total across all A1 instances
-- 200 GB boot volume total
-- 10 TB outbound data/month
-- 1 load balancer (10 Mbps)
-
----
-
-## Security
-
-- **Secrets are never in code** — they live in GitHub's encrypted Secrets store
-- **Private keys are not committed** — `.gitignore` prevents accidental commits
-- **No hardcoded credentials** — all values come from environment variables
-- **Public repo is safe** — secrets are injected at runtime, never visible
-
----
 
 ## Troubleshooting
 
-| Error | Likely Cause | Fix |
-|-------|-------------|-----|
-| `401 NotAuthenticated` | Bad fingerprint or private key | Check `OCI_FINGERPRINT` and `OCI_PRIVATE_KEY` secrets |
-| `404 NotAuthorizedOrNotFound` | Wrong compartment or subnet OCID | Verify OCIDs in Oracle Console |
-| `400 InvalidParameter` | Image is x86, not ARM | Use an `aarch64` (ARM) image for A1.Flex |
-| `Out of capacity` forever | Region permanently full | Try a different region (new account) |
-| `429 Too many requests` | Even 10 min is too fast | Increase interval to 15 min in workflow YAML |
-
----
-
-## FAQ
-
-**Q: Is this against Oracle's Terms of Service?**
-A: No. This uses the official OCI Python SDK and public API, exactly as documented. It simply automates the same "Create Instance" button you'd click manually.
-
-**Q: Will I get charged?**
-A: No — as long as you stay within Always Free limits (4 OCPU, 24 GB RAM, 200 GB storage). Set up budget alerts in Oracle Console just to be safe.
-
-**Q: How long does it take?**
-A: It depends entirely on your region's capacity. Some users get it in hours, others wait days or weeks. High-demand regions like US Ashburn are often permanently full. Less popular regions like Frankfurt or Jeddah sometimes have better availability.
-
-**Q: Can I run this for multiple regions?**
-A: Yes — duplicate the workflow file and change the region/AD/image values. But you need a separate Oracle account per region (Oracle locks your home region at signup).
-
-**Q: What happens after the instance is created?**
-A: The script sends a notification (if configured) and exits. The workflow keeps running but the script sees the instance already exists and does nothing. You should disable the workflow to stop burning GitHub minutes.
-
----
+| Symptom | Check |
+|---|---|
+| Missing secret / configuration error | Confirm every required secret is present and non-empty. Check that the AD name ends in `:AP-MUMBAI-1-AD-1`. |
+| `401 NotAuthenticated` | Verify user OCID, tenancy OCID, fingerprint, and that `OCI_PRIVATE_KEY` matches the API key registered for that user. |
+| `NotAuthorizedOrNotFound` / 404 | Verify compartment, subnet, image OCIDs and the OCI policy grants above. The OCI region is fixed to Mumbai. |
+| Image validation fails | Choose a Mumbai image reporting Ubuntu `24.04` (or `24.04.x`) and compatible with `VM.Standard.A1.Flex` (ARM64). |
+| Capacity or 429 failure | Expected in busy regions; review the run log. The script retries twice after the initial attempt and scheduled runs continue every 10 minutes. |
+| Instance has no public IP | Confirm the subnet is public, public IPv4 assignment is allowed, and its route table uses an Internet Gateway. |
+| SSH connection fails | Confirm the instance is `RUNNING`, the subnet security list/NSG allows TCP 22 from your IP, and use the matching local SSH private key. |
+| Workflow did not stop after success | Check the “Disable workflow” step and repository Actions permissions. If needed, disable it manually; the instance lookup remains a duplicate guard. |
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
-
----
-
-> Built with ❤️ for the free tier community. Good luck snagging that A1 instance! 🚀
+MIT License — see [LICENSE](LICENSE).
